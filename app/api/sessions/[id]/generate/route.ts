@@ -1,0 +1,153 @@
+import { NextResponse } from "next/server"
+import { getSession } from "@/lib/auth"
+import { getDatabase } from "@/lib/mongodb"
+import { ObjectId } from "mongodb"
+import OpenAI from "openai"
+import { z } from "zod"
+
+// schema
+const questionSchema = z.object({
+  questions: z.array(
+    z.object({
+      question: z.string(),
+      shortAnswer: z.string(),
+    })
+  ),
+})
+
+// OpenRouter init
+const client = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY!,
+  baseURL: "https://openrouter.ai/api/v1",
+})
+
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    // ✅ Auth
+    const session = await getSession()
+    if (!session) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+
+    const { id } = await params
+
+    // ✅ DB
+    const db = await getDatabase()
+
+    const interviewSession = await db.collection("sessions").findOne({
+      _id: new ObjectId(id),
+      userId: session.userId,
+    })
+
+    if (!interviewSession) {
+      return NextResponse.json(
+        { error: "Session not found" },
+        { status: 404 }
+      )
+    }
+
+    // ✅ STRONG PROMPT
+    const prompt = `Generate 10 interview questions for a ${interviewSession.title} role.
+
+Topics: ${interviewSession.topics}
+Experience: ${interviewSession.experience}
+
+Each question MUST include a detailed answer (minimum 4-5 lines).
+
+Answers should:
+- Be clear and practical
+- Include examples if possible
+- Be useful for real interviews
+
+Strictly return ONLY valid JSON.
+Do NOT add any text before or after JSON.
+
+Format:
+{
+  "questions": [
+    {
+      "question": "Full question here",
+      "shortAnswer": "Detailed answer (4-5 lines explanation)"
+    }
+  ]
+}`
+
+    // ✅ OpenRouter call
+    const completion = await client.chat.completions.create({
+      model: "meta-llama/llama-3-8b-instruct",
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+    })
+
+    let text = completion.choices[0].message.content || ""
+
+    console.log("AI RAW RESPONSE:", text) // 🔥 debug
+
+    // ✅ Extract JSON safely
+    const match = text.match(/\{[\s\S]*\}/)
+
+    if (!match) {
+      throw new Error("No JSON found in AI response")
+    }
+
+    const jsonString = match[0]
+
+    let parsed
+    try {
+      parsed = JSON.parse(jsonString)
+    } catch {
+      throw new Error("AI returned invalid JSON")
+    }
+
+    let object = questionSchema.parse(parsed)
+
+    // ✅ Fallback fix (if AI gives empty answers)
+    object.questions = object.questions.map((q) => ({
+      ...q,
+      shortAnswer:
+        q.shortAnswer && q.shortAnswer !== "..."
+          ? q.shortAnswer
+          : "Answer not generated properly. Please regenerate.",
+    }))
+
+    // ✅ Save to DB
+    const questionsToInsert = object.questions.map((q) => ({
+      sessionId: id,
+      question: q.question,
+      shortAnswer: q.shortAnswer,
+      createdAt: new Date(),
+    }))
+
+    await db.collection("questions").insertMany(questionsToInsert)
+
+    await db.collection("sessions").updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          questionCount: object.questions.length,
+          lastUpdated: new Date(),
+        },
+      }
+    )
+
+    return NextResponse.json({
+      success: true,
+      questions: questionsToInsert,
+    })
+
+  } catch (error: any) {
+    console.error("ERROR:", error)
+
+    return NextResponse.json(
+      { error: error.message || "Internal server error" },
+      { status: 500 }
+    )
+  }
+}
