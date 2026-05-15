@@ -26,7 +26,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    // ✅ Auth
+    // Auth
     const session = await getSession()
     if (!session) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
@@ -34,7 +34,7 @@ export async function POST(
 
     const { id } = await params
 
-    // ✅ DB
+    // DB
     const db = await getDatabase()
 
     const interviewSession = await db.collection("sessions").findOne({
@@ -43,17 +43,37 @@ export async function POST(
     })
 
     if (!interviewSession) {
-      return NextResponse.json(
-        { error: "Session not found" },
-        { status: 404 }
-      )
+      return NextResponse.json({ error: "Session not found" }, { status: 404 })
     }
 
-    // ✅ STRONG PROMPT
+    // Normalize experience
+    const experienceRaw = interviewSession.experience
+    const experience =
+      typeof experienceRaw === "string"
+        ? experienceRaw.trim().toLowerCase()
+        : String(experienceRaw ?? "").trim().toLowerCase()
+
+    const isFresher =
+      experience === "fresher" ||
+      experience === "0" ||
+      experience === "0 years" ||
+      experience === "0 year" ||
+      experience === "beginner"
+
+    const experienceText = isFresher
+      ? "Fresher (0 years of experience)"
+      : `${interviewSession.experience} years of experience`
+
+    // Strong prompt
     const prompt = `Generate 10 interview questions for a ${interviewSession.title} role.
 
 Topics: ${interviewSession.topics}
-Experience: ${interviewSession.experience}
+Experience Level: ${experienceText}
+
+If the candidate is a fresher:
+- Ask beginner-friendly and basic interview questions
+- Focus on fundamentals, concepts, projects, internships, and common HR questions
+- Avoid advanced senior-level questions
 
 Each question MUST include a detailed answer (minimum 4-5 lines).
 
@@ -75,7 +95,7 @@ Format:
   ]
 }`
 
-    // ✅ OpenRouter call
+    // OpenRouter call
     const completion = await client.chat.completions.create({
       model: "meta-llama/llama-3-8b-instruct",
       messages: [
@@ -86,30 +106,26 @@ Format:
       ],
     })
 
-    let text = completion.choices[0].message.content || ""
+    const text = completion.choices[0].message.content || ""
+    console.log("AI RAW RESPONSE:", text)
 
-    console.log("AI RAW RESPONSE:", text) // 🔥 debug
-
-    // ✅ Extract JSON safely
+    // Extract JSON safely
     const match = text.match(/\{[\s\S]*\}/)
-
     if (!match) {
       throw new Error("No JSON found in AI response")
     }
 
-    const jsonString = match[0]
-
     let parsed
     try {
-      parsed = JSON.parse(jsonString)
+      parsed = JSON.parse(match[0])
     } catch {
       throw new Error("AI returned invalid JSON")
     }
 
-    let object = questionSchema.parse(parsed)
+    const object = questionSchema.parse(parsed)
 
-    // ✅ Fallback fix (if AI gives empty answers)
-    object.questions = object.questions.map((q) => ({
+    // Fallback fix
+    const cleanedQuestions = object.questions.map((q) => ({
       ...q,
       shortAnswer:
         q.shortAnswer && q.shortAnswer !== "..."
@@ -117,8 +133,8 @@ Format:
           : "Answer not generated properly. Please regenerate.",
     }))
 
-    // ✅ Save to DB
-    const questionsToInsert = object.questions.map((q) => ({
+    // Save to DB
+    const questionsToInsert = cleanedQuestions.map((q) => ({
       sessionId: id,
       question: q.question,
       shortAnswer: q.shortAnswer,
@@ -131,7 +147,7 @@ Format:
       { _id: new ObjectId(id) },
       {
         $set: {
-          questionCount: object.questions.length,
+          questionCount: questionsToInsert.length,
           lastUpdated: new Date(),
         },
       }
@@ -141,7 +157,6 @@ Format:
       success: true,
       questions: questionsToInsert,
     })
-
   } catch (error: any) {
     console.error("ERROR:", error)
 
